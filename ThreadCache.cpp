@@ -1,30 +1,30 @@
 #include "ThreadCache.h"
 #include "CentralCache.h"
-#include "PageCache.h"
 
-void* ThreadCache::FetchFromCentralCache(size_t index, size_t byte_size)
+void* ThreadCache::FetchFromCentralCache(size_t i, size_t size)
 {
-	FreeList* list = &_freeList[index];
-	assert(list->Empty());
+	// 获取一批对象，数量使用慢启动方式
+	// SizeClass::NumMoveSize(size)是上限值
+	size_t batchNum = min(SizeClass::NumMoveSize(size), _freeLists[i].MaxSize());
 
-	// 从中心Cache获取一定数量的对象，插入到当前的ThreadCahche,返回第一个对象
-	// 每次获取的数量是不断变化的，开始很小，后续慢慢增大，类似网络中拥塞控制的慢启动算法
-	// 增长到num_to_move就不再增长了
-	size_t num_to_move = SizeClass::NumMoveSize(byte_size);
-	size_t batch_size = std::min<int>(num_to_move, list->MaxSize());
-	void *start, *end;
-	int fetch_count = CentralCache::GetInstance()->FetchRangeObj(start, end, batch_size, byte_size);
-	assert(fetch_count);
+	// 去中心缓存获取batch_num个对象
+	void* start = nullptr;
+	void* end = nullptr;
+	size_t actualNum = CentralCache::GetInstance()->FetchRangeObj(start, end, batchNum, SizeClass::RoundUp(size));
+	assert(actualNum > 0);
 
-	if (fetch_count > 1)
+	// >1，返回一个，剩下挂到自由链表
+	// 如果一次申请多个，剩下挂起来，下次申请就不需要找中心缓存
+	// 减少锁竞争，提高效率
+	if (actualNum > 1)
 	{
-		list->PushRange(NEXT_OBJ(start), end, fetch_count - 1);
+		_freeLists[i].PushRange(NextObj(start), end, actualNum - 1);
 	}
 
-	// 每次一批内存对象用完了，maxsize+1，下次批量多获取一个对象
-	if (list->MaxSize() < num_to_move)
+	// 慢启动增长
+	if (_freeLists[i].MaxSize() == batchNum)
 	{
-		list->SetMaxSize(list->MaxSize() + 1);
+		_freeLists[i].SetMaxSize(_freeLists[i].MaxSize() + 1);
 	}
 
 	return start;
@@ -32,46 +32,36 @@ void* ThreadCache::FetchFromCentralCache(size_t index, size_t byte_size)
 
 void* ThreadCache::Allocate(size_t size)
 {
-	assert(size <= MAX_BYTES);
-
-	size = SizeClass::RoundUp(size);
-
-	//1.当前线程堆的自由链表中有，直接在自由链表中取
-	//2.没有则到中心堆的自由链表中取
-	size_t index = SizeClass::Index(size);
-	FreeList* list = &_freeList[index];
-	if (list->Empty()) {
-		return FetchFromCentralCache(index, size);
+	size_t i = SizeClass::Index(size);
+	if (!_freeLists[i].Empty())
+	{
+		return _freeLists[i].Pop();
 	}
-	else {
-		return list->Pop();
+	else
+	{
+		return FetchFromCentralCache(i, size);
 	}
 }
 
 void ThreadCache::Deallocate(void* ptr, size_t size)
 {
-	size_t index = SizeClass::Index(size);
-	FreeList* list = &_freeList[index];
-	list->Push(ptr);
+	size_t i = SizeClass::Index(size);
+	_freeLists[i].Push(ptr);
 
-	if (list->Size() > list->MaxSize())
+	// List Too Long central cache 去释放
+	if (_freeLists[i].Size() >= _freeLists[i].MaxSize())
 	{
-		ListTooLong(list, size);
+		ListTooLong(_freeLists[i], size);
 	}
 }
 
-void ThreadCache::ListTooLong(FreeList* list, size_t size)
+// 释放对象时，链表过长时，回收内存回到中心缓存
+void ThreadCache::ListTooLong(FreeList& list, size_t size)
 {
-	//size_t num_to_move = SizeClass::NumMoveSize(size);
-	//while (list->Size() > num_to_move)
-	//{
-	//	void* start = nullptr, *end = nullptr;
-	//	list->PopRange(start, end, num_to_move);
-	//	CentralCache::GetInstance()->ReleaseListToSpans(start, end, size);
-	//}
+	size_t batchNum = list.MaxSize();
+	void* start = nullptr;
+	void* end = nullptr;
+	list.PopRange(start, end, batchNum);
 
-	size_t num_to_move = list->Size();
-	void* start, *end;
-	list->PopRange(start, end, num_to_move);
 	CentralCache::GetInstance()->ReleaseListToSpans(start, size);
 }
